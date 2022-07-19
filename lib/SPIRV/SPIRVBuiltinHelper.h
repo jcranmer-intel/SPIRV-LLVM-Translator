@@ -1,0 +1,249 @@
+//===- SPIRVBuiltinHelper.h - Helpers for managing calls to builtins ------===//
+//
+//                     The LLVM/SPIR-V Translator
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+// Copyright (c) 2022 The Khronos Group Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal with the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// Redistributions of source code must retain the above copyright notice,
+// this list of conditions and the following disclaimers.
+// Redistributions in binary form must reproduce the above copyright notice,
+// this list of conditions and the following disclaimers in the documentation
+// and/or other materials provided with the distribution.
+// Neither the names of The Khronos Group, nor the names of its
+// contributors may be used to endorse or promote products derived from this
+// Software without specific prior written permission.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH
+// THE SOFTWARE.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements helper functions for adding calls to OpenCL or SPIR-V
+// builtin functions, or for rewriting calls to one into calls to the other.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef SPIRVBUILTINHELPER_H
+#define SPIRVBUILTINHELPER_H
+
+#include "LLVMSPIRVLib.h"
+#include "libSPIRV/SPIRVOpCode.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/TypedPointerType.h"
+
+namespace SPIRV {
+enum class ManglingRules { None, OpenCL, SPIRV };
+
+namespace detail {
+  /// This is a helper for triggering the static_assert in mapArg.
+  template <typename> constexpr bool LegalFnType = false;
+}
+
+/// A helper class for changing OpenCL builtin function calls to SPIR-V function
+/// calls, or vice versa. Most of the functions will return a reference to the
+/// current instance, allowing calls to be chained together, for example:
+///     mutateCallInst(CI, NewFuncName)
+///       .removeArg(3)
+///       .appendArg(translateScope());
+///
+/// Only when the destuctor of this object is called will the original CallInst
+/// be destroyed and replaced with the new CallInst be created.
+class BuiltinCallMutator {
+  llvm::CallInst *CI;
+  std::string FuncName;
+  std::function<llvm::Value *(llvm::IRBuilder<> &, llvm::CallInst *)> MutateRet;
+  typedef decltype(MutateRet) MutateRetFuncTy;
+  llvm::AttributeList Attrs;
+  llvm::Type *ReturnTy;
+  llvm::SmallVector<llvm::Value *, 8> Args;
+  llvm::SmallVector<llvm::TypedPointerType *, 8> PointerTypes;
+  ManglingRules Rules;
+
+  friend class BuiltinCallHelper;
+  BuiltinCallMutator(
+      llvm::CallInst *CI, std::string FuncName, ManglingRules Rules,
+      std::function<std::string(llvm::StringRef)> NameMapFn = nullptr);
+
+  void setElementType(unsigned Index, llvm::Type *ElementType);
+
+  llvm::Value *doConversion();
+
+public:
+  ~BuiltinCallMutator() {
+    if (CI)
+      doConversion();
+  }
+  BuiltinCallMutator(const BuiltinCallMutator &) = delete;
+  BuiltinCallMutator &operator=(const BuiltinCallMutator &) = delete;
+  BuiltinCallMutator &operator=(BuiltinCallMutator &&) = delete;
+  BuiltinCallMutator(BuiltinCallMutator &&);
+
+  /// The builder used to generate IR for this call.
+  llvm::IRBuilder<> Builder;
+
+  /// Return the resulting new instruction. It is not possible to use any
+  /// method on this object after calling this function.
+  llvm::Value *getMutated() { return doConversion(); }
+
+  /// Return the number of arguments currently specified for the new call.
+  unsigned arg_size() const { return Args.size(); }
+
+  /// Get the corresponding argument for the new call.
+  llvm::Value *getArg(unsigned Index) const { return Args[Index]; }
+
+  /// Return the pointer element type of the corresponding index, or nullptr if
+  /// it is not a pointer.
+  llvm::Type *getPointerElementType(unsigned Index) const {
+    llvm::TypedPointerType *ElTy = PointerTypes[Index];
+    return ElTy ? ElTy->getElementType() : nullptr;
+  }
+
+  /// A pair representing both the LLVM value of an argument and its
+  /// corresponding pointer element type. This type can be constructed from
+  /// implicit conversion from an LLVM value object (but only if it is not of
+  /// pointer type), or by the appropriate std::pair type.
+  struct ValueTypePair : public std::pair<llvm::Value *, llvm::Type *> {
+    ValueTypePair(llvm::Value *V) : pair(V, nullptr) {
+      assert(!V->getType()->isPointerTy() &&
+             "Must specify a pointer element type if value is a pointer.");
+    }
+    ValueTypePair(std::pair<llvm::Value *, llvm::Type *> P) : pair(P) {}
+    ValueTypePair(llvm::Value *V, llvm::Type *T) : pair(V, T) {}
+    ValueTypePair() = delete;
+    using pair::pair;
+  };
+
+  /// Use the following arguments as the arguments of the new call, replacing
+  /// any previous arguments. This version may not be used if any argument is of
+  /// pointer type.
+  BuiltinCallMutator &setArgs(llvm::ArrayRef<llvm::Value *> Args);
+
+  /// This will replace the return type of the call with a different return
+  /// type. The second argument is a function that will be called with an
+  /// IRBuilder parameter and the newly generated function, and will return the
+  /// value to replace all uses of the original call instruction with. Example
+  /// usage:
+  ///
+  ///     BuiltinCallMutator Mutator = /* ... */;
+  ///     Mutator.changeReturnType(Int16Ty, [](IRBuilder<> &IRB, CallInst *CI) {
+  ///       return IRB.CreateZExt(CI, Int16Ty);
+  ///     });
+  BuiltinCallMutator &changeReturnType(llvm::Type *ReturnTy,
+                                       MutateRetFuncTy MutateFunc);
+
+  /// Insert an argument before the given index.
+  BuiltinCallMutator &insertArg(unsigned Index, ValueTypePair Arg);
+
+  /// Add an argument to the end of the argument list.
+  BuiltinCallMutator &appendArg(ValueTypePair Arg) {
+    return insertArg(Args.size(), Arg);
+  }
+
+  /// Replace the argument at the given index with a new value.
+  BuiltinCallMutator &replaceArg(unsigned Index, ValueTypePair Arg);
+
+  /// Remove the argument at the given index.
+  BuiltinCallMutator &removeArg(unsigned Index);
+
+  /// Remove all arguments in a range.
+  BuiltinCallMutator &removeArgs(unsigned Start, unsigned Len) {
+    for (unsigned I = 0; I < Len; I++)
+      removeArg(Start);
+    return *this;
+  }
+
+  /// Move the argument from the given index to the new index.
+  BuiltinCallMutator &moveArg(unsigned FromIndex, unsigned ToIndex) {
+    if (FromIndex == ToIndex)
+      return *this;
+    ValueTypePair Pair(Args[FromIndex], getPointerElementType(FromIndex));
+    removeArg(FromIndex);
+    insertArg(ToIndex, Pair);
+    return *this;
+  }
+
+  /// Use a callback function or lambda to convert an argument to a new value.
+  /// The expected return type of the lambda is anything that is convertible
+  /// to ValueTypePair, which could be a single Value* (but only if it is not
+  /// pointer-typed), or a std::pair<Value *, Type *>. The possible signatures
+  /// of the function parameter are as follows:
+  ///     ValueTypePair func(IRBuilder<> &Builder, Value *, Type *);
+  ///     ValueTypePair func(IRBuilder<> &Builder, Value *);
+  ///     ValueTypePair func(Value *, Type *);
+  ///     ValueTypePair func(Value *);
+  ///
+  /// When present, the IRBuilder parameter corresponds to a builder that is set
+  /// to insert immediately before the new call instruction. The Value parameter
+  /// corresponds to the argument to be mutated. The Type parameter, when
+  /// present, corresponds to the pointer element type of the argument, or null
+  /// when it is not present.
+  template <typename FnType>
+  BuiltinCallMutator &mapArg(unsigned Index, FnType Func) {
+    using namespace llvm;
+    IRBuilder<> Builder(CI);
+    Value *V = Args[Index];
+    Type *T = getPointerElementType(Index);
+    (void)T; // This may be unused in some template invocations.
+    if constexpr (is_invocable<FnType, IRBuilder<>&, Value*, Type *>::value)
+      replaceArg(Index, Func(Builder, V, T));
+    else if constexpr (is_invocable<FnType, IRBuilder<>&, Value *>::value)
+      replaceArg(Index, Func(Builder, V));
+    else if constexpr (is_invocable<FnType, Value *, Type *>::value)
+      replaceArg(Index, Func(V, T));
+    else if constexpr (is_invocable<FnType, Value *>::value)
+      replaceArg(Index, Func(V));
+    else {
+      // We need a helper value that is always false, but is dependent on the
+      // template parameter to prevent this static_assert from firing when one
+      // of the if constexprs above fires.
+      static_assert(detail::LegalFnType<FnType>,
+          "mapArg function arguments not satisfied");
+    }
+    return *this;
+  }
+
+  /// Map all arguments according to the given function.
+  template <typename FnType> BuiltinCallMutator &mapArgs(FnType Func) {
+    for (unsigned I = 0, E = Args.size(); I < E; I++)
+      mapArg(I, Func);
+    return *this;
+  }
+};
+
+class BuiltinCallHelper {
+  ManglingRules Rules;
+  std::function<std::string(llvm::StringRef)> NameMapFn;
+
+protected:
+  llvm::Module *M = nullptr;
+
+public:
+  explicit BuiltinCallHelper(
+      ManglingRules Rules,
+      std::function<std::string(llvm::StringRef)> NameMapFn = nullptr)
+      : Rules(Rules), NameMapFn(std::move(NameMapFn)) {}
+  void initialize(llvm::Module &M) { this->M = &M; }
+
+  BuiltinCallMutator mutateCallInst(llvm::CallInst *CI, spv::Op Opcode);
+  BuiltinCallMutator mutateCallInst(llvm::CallInst *CI, std::string FuncName);
+};
+
+} // namespace SPIRV
+
+#endif // SPIRVBUILTINHELPER_H
